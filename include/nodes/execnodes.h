@@ -1990,8 +1990,8 @@ typedef struct HashJoinState
 	/* modified:扩展当前内部和外部元组在桶中index字段*/
 	int			hj_InnerCurBucketNo;
 	int         hj_OuterCurBucketNo;
-	int			hj_InnerCurSkewBucketNo;
-	int         hj_OuterCurSkewBucketNo;
+	//int			hj_InnerCurSkewBucketNo;
+	//int         hj_OuterCurSkewBucketNo;
 
 	/* modified:扩展当前扫描的内部和外部元组存储数据字段 */
 	HashJoinTuple hj_CurInnerTuple;
@@ -2338,7 +2338,8 @@ typedef struct SharedHashInfo
 } SharedHashInfo;
 
 /* ----------------
- *	 HashState information
+ *	 HashState information 
+ *	 modified:添加一个正在探测的元组的字段
  * ----------------
  */
 typedef struct HashState
@@ -2352,6 +2353,11 @@ typedef struct HashState
 
 	/* Parallel hash state. */
 	struct ParallelHashJoinState *parallel_state;
+
+#ifndef MIXJOIN_MODE
+	HashJoinTuple curtuple;		/* current tuple in hash table */
+#endif
+	
 } HashState;
 
 /* ----------------

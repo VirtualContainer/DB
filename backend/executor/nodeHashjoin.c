@@ -128,7 +128,7 @@
 #define HJ_FILL_OUTER_TUPLE		4
 #define HJ_FILL_INNER_TUPLES	5
 #define HJ_NEED_NEW_BATCH		6
-
+ 
 /* modified: 扩展join的状态值 */
 #else 
 #define HJ_BUILD_HASHTABLE 1
@@ -138,8 +138,9 @@
 #define HJ_SCAN_OUTER_BUCKET 5
 #define HJ_FILL_INNER_TUPLES 6
 #define HJ_FILL_OUTER_TUPLES 7
+#define HJ_ENDING_HANDLE 8
 #endif
-
+ 
 /* Returns true if doing null-fill on outer relation */
 #define HJ_FILL_OUTER(hjstate)	((hjstate)->hj_NullInnerTupleSlot != NULL)
 /* Returns true if doing null-fill on inner relation */
@@ -587,53 +588,70 @@ ExecHashJoinImpl(PlanState *pstate, bool parallel)
 		}
 	}
 }
-
+ 
 #else
+
+#define SetMatchTupleTag(hashtuple) HeapTupleHeaderSetMatch(HJTUPLE_MINTUPLE(hashtuple))
+
 static pg_attribute_always_inline TupleTableSlot *
 ExecHashJoinImpl(PlanState *pstate, bool parallel)
 {
+	/* 强制转化 */
 	HashJoinState *node = castNode(HashJoinState, pstate);
-	EState* estate;
+	/* 内外哈希节点*/
 	HashState *inner_hashnode,*outer_hashnode;
+	/* 当前和子节点的表达式上下文 */
 	ExprContext *econtext;
 	ExprContext *outer_econtext,*inner_econtext;
+	/* 用于内外元组哈希的哈希表*/
 	HashJoinTable inner_hashtable,outer_hashtable;
+	/* 存储当前取出的内外元组 */
 	TupleTableSlot *outer_tupleslot,*inner_tupleslot;
-	//HeapTuple current_tuple;
+	/* 分批序号默认为0*/
 	int batch_number = 0;
-
-	estate = node->js.ps.state;
+	/* 连接条件 */
 	List *joinqual,*otherqual;
+ 
 	joinqual = node->js.joinqual;
 	otherqual = node->js.ps.qual;
+ 
 	inner_hashnode = (HashState *) innerPlanState(node);
 	outer_hashnode = (HashState *) outerPlanState(node);
+ 
 	inner_hashtable = node->hj_InnerHashTable;
 	outer_hashtable = node->hj_OuterHashTable;	
 	econtext = node->js.ps.ps_ExprContext;
 	inner_econtext = inner_hashnode->ps.ps_ExprContext;
 	outer_econtext = outer_hashnode->ps.ps_ExprContext;
-
-	int inner_hashvalue;
-	int outer_hashvalue;
-
+ 
+	
+	int inner_hashvalue = 0;
+	int outer_hashvalue = 0;
+ 
 	ResetExprContext(econtext);
 	ResetExprContext(inner_econtext);
 	ResetExprContext(outer_econtext);
 	
+	if(node->js.jointype==JOIN_RIGHT)
+		node->IsFetchInnerNode = false;
+ 
 	/* modified:run the hash join state machine */
-	TupleTableSlot* result;
+	TupleTableSlot* result = NULL;
 	while(1)
 	{
 		CHECK_FOR_INTERRUPTS();
+		
+ 
 		switch(node->hj_JoinState)
 		{
 			/* modified:构建哈希表 */
 			case HJ_BUILD_HASHTABLE:
-				Assert(inner_hashtable==NULL);
-				Assert(outer_hashtable==NULL);
-				inner_hashtable = ExecHashTableCreate(inner_hashnode, node->hj_HashOperators, node->hj_Collations, HJ_FILL_OUTER(node));
-				outer_hashtable = ExecHashTableCreate(outer_hashnode, node->hj_HashOperators, node->hj_Collations, HJ_FILL_INNER(node));
+				//Assert(inner_hashtable==NULL);
+				//Assert(outer_hashtable==NULL);
+				if(!inner_hashtable)
+					inner_hashtable = ExecHashTableCreate(inner_hashnode, node->hj_HashOperators, node->hj_Collations, HJ_FILL_OUTER(node));
+				if(!outer_hashtable)
+					outer_hashtable = ExecHashTableCreate(outer_hashnode, node->hj_HashOperators, node->hj_Collations, HJ_FILL_INNER(node));
 				node->hj_InnerHashTable = inner_hashtable;
 				node->hj_OuterHashTable = outer_hashtable;
 				inner_hashnode->hashtable = inner_hashtable;
@@ -644,54 +662,82 @@ ExecHashJoinImpl(PlanState *pstate, bool parallel)
 					node->hj_JoinState = HJ_NEED_NEW_OUTER;
 				continue;
 
+			case HJ_ENDING_HANDLE:
+				if(HJ_FILL_INNER(node))
+				{
+					//node->hj_InnerCurBucketNo = 0;
+					node->hj_OuterCurBucketNo = 0;
+					//node->hj_CurOuterTuple = NULL;
+					node->hj_CurInnerTuple = NULL;
+					node->hj_JoinState = HJ_FILL_INNER_TUPLES;
+					continue;
+				}
+				return NULL;
+
 			/* modified:取外表的元组去匹配内部哈希节点*/
 			case HJ_NEED_NEW_OUTER:
+			    if(node->hj_OuterIsExhausted)
+				{
+					if(node->hj_InnerIsExhausted)
+					{
+						node->hj_JoinState = HJ_ENDING_HANDLE;
+						continue;
+					}
+					node->hj_JoinState = HJ_NEED_NEW_INNER;
+					continue;
+				}		
 				node->IsFetchInnerNode = false;
 				node->hj_Matched = false;
-			    outer_tupleslot = ExecProcNode(outer_hashnode);
+			    outer_tupleslot = ExecProcNode((PlanState*)outer_hashnode);
+			
 				if(TupIsNull(outer_tupleslot))
 				{
 					node->hj_OuterIsExhausted = true;
 					if(node->hj_InnerIsExhausted)
-						return NULL;
+					{
+						node->hj_JoinState = HJ_ENDING_HANDLE;
+						continue;
+					}	
 					node->hj_JoinState = HJ_NEED_NEW_INNER;
 					continue;
 				}
 				else
 				{
-					/* 加载外表元组到内表表达式内存上下文 */
-					node->hj_CurOuterTuple = outer_tupleslot;
-					inner_econtext->ecxt_outertuple = MakeTupleTableSlot(ExecGetResultType((PlanState*)outer_hashnode),&TTSOpsMinimalTuple);
-					inner_econtext->ecxt_outertuple = ExecStoreMinimalTuple(ExecCopySlotMinimalTuple(node->hj_CurOuterTuple),inner_econtext->ecxt_outertuple,false);
-					inner_econtext->ecxt_innertuple = inner_econtext->ecxt_outertuple; 
+					/*从头开始扫描*/
+					node->hj_CurInnerTuple = NULL;
+					node->hj_CurOuterTuple = outer_hashnode->curtuple;
 
+					/* 加载外表元组到内表表达式上下文 */
+					econtext->ecxt_outertuple = outer_tupleslot;
+					inner_econtext->ecxt_outertuple = outer_tupleslot;
+					inner_econtext->ecxt_innertuple = inner_econtext->ecxt_outertuple; 
+ 
 					/* 计算外表元组在内部哈希函数的哈希值 */
 					ExecHashGetHashValue(inner_hashtable, inner_econtext, node->hj_OuterHashKeys, false, false,&outer_hashvalue);
 					node->hj_OuterCurHashValue = outer_hashvalue;
 					
 					/* 通过哈希值获取外表元组在内部哈希表的桶编号*/
 					ExecHashGetBucketAndBatch(inner_hashtable, outer_hashvalue, &node->hj_InnerCurBucketNo, &batch_number);
-					
-					node->hj_CurInnerTuple = NULL;
-					node->hj_CurOuterTuple = NULL;
 					node->hj_JoinState = HJ_SCAN_INNER_BUCKET;
-					econtext->ecxt_outertuple = inner_econtext->ecxt_outertuple; 
+					//econtext->ecxt_outertuple = inner_econtext->ecxt_outertuple; 
 				}
 				
 			/* modified:扫描内部哈希桶 */
-			case HJ_SCAN_INNER_BUCKET:
-			    /* 扫描哈希桶 */				
+			case HJ_SCAN_INNER_BUCKET:				
 				if(ExecScanHashBucket(node,econtext)==false)
 				{
+					/*匹配失败去填充NULL*/
 					node->hj_JoinState = HJ_FILL_OUTER_TUPLES;
 					continue;
-				}
-				node->hj_JoinState = HJ_NEED_NEW_INNER;				
+				}		
 				if(joinqual == NULL || ExecQual(joinqual,econtext))
 				{
 					node->hj_Matched = true;
+					SetMatchTupleTag(node->hj_CurInnerTuple);
+					//SetMatchTupleTag(node->hj_CurOuterTuple);
 					if(otherqual == NULL || ExecQual(otherqual,econtext))
-					{	
+					{
+						node->hj_JoinState = HJ_SCAN_INNER_BUCKET;
 						result = ExecProject(node->js.ps.ps_ProjInfo);
 						return result;
 					}
@@ -700,7 +746,7 @@ ExecHashJoinImpl(PlanState *pstate, bool parallel)
 				}
 				else
 					InstrCountFiltered1(node,1);
-				break;
+				continue;
 			
 			/* 可能需要填充空元组 */
 			case HJ_FILL_OUTER_TUPLES:			
@@ -718,60 +764,82 @@ ExecHashJoinImpl(PlanState *pstate, bool parallel)
 						InstrCountFiltered2(node,1);
 				}
 				continue;
+ 
 
-			/* 以下为上面的相反步骤 */
+
+			/* 以下为取内元组步骤 */
 			case HJ_NEED_NEW_INNER:
+				if(node->hj_InnerIsExhausted)
+				{
+					if(node->hj_OuterIsExhausted)
+					{
+						node->hj_JoinState = HJ_ENDING_HANDLE;
+						continue;
+					}
+					node->hj_JoinState = HJ_NEED_NEW_OUTER;
+					continue;
+				}
+
 				node->IsFetchInnerNode = true;
 				node->hj_Matched = false;
 				inner_tupleslot = ExecProcNode(inner_hashnode);
+				
 				if(TupIsNull(inner_tupleslot))
 				{
 					node->hj_InnerIsExhausted = true;
 					if(node->hj_OuterIsExhausted)
-						return NULL;
+					{
+						node->hj_JoinState = HJ_ENDING_HANDLE;
+						continue;
+					}
 					node->hj_JoinState = HJ_NEED_NEW_OUTER;
 					continue;
 				}
 				else
 				{
-					node->hj_CurInnerTuple = inner_tupleslot;
-					outer_econtext->ecxt_innertuple = MakeTupleTableSlot(ExecGetResultType((PlanState*)inner_hashnode),&TTSOpsMinimalTuple);
-					outer_econtext->ecxt_innertuple = ExecStoreMinimalTuple(ExecCopySlotMinimalTuple(node->hj_CurInnerTuple),outer_econtext->ecxt_innertuple,false);
-					outer_econtext->ecxt_outertuple = outer_econtext->ecxt_innertuple;
-
+					node->hj_CurOuterTuple = NULL;
+					node->hj_CurInnerTuple = inner_hashnode->curtuple;
+					econtext->ecxt_innertuple = inner_tupleslot;
+					outer_econtext->ecxt_innertuple = inner_tupleslot;
+					outer_econtext->ecxt_outertuple = outer_econtext->ecxt_innertuple;				
 					ExecHashGetHashValue(outer_hashtable, outer_econtext, node->hj_InnerHashKeys, false, false,&inner_hashvalue);
 					node->hj_InnerCurHashValue = inner_hashvalue;
 					ExecHashGetBucketAndBatch(outer_hashtable, inner_hashvalue, &node->hj_OuterCurBucketNo, &batch_number);
-					node->hj_CurOuterTuple = NULL;
-					node->hj_CurInnerTuple = NULL;
 					node->hj_JoinState = HJ_SCAN_OUTER_BUCKET;
-					econtext->ecxt_innertuple = outer_econtext->ecxt_innertuple;
 				}
-
+ 
 			case HJ_SCAN_OUTER_BUCKET:
-				
 				if(ExecScanHashBucket(node,econtext)==false)
 				{
-					node->hj_JoinState = HJ_FILL_INNER_TUPLES;
+					/*匹配失败去取外元组*/
+					node->hj_JoinState = HJ_NEED_NEW_OUTER;
 					continue;
 				}
-				node->hj_JoinState = HJ_NEED_NEW_OUTER;
 				if(joinqual == NULL || ExecQual(joinqual,econtext))
 				{
 					node->hj_Matched = true;
+					SetMatchTupleTag(node->hj_CurInnerTuple);
+					//SetMatchTupleTag(node->hj_CurOuterTuple);
 					if(otherqual == NULL || ExecQual(otherqual,econtext))
-						return ExecProject(node->js.ps.ps_ProjInfo);
+					{	
+						node->hj_JoinState = HJ_SCAN_OUTER_BUCKET;
+						result = ExecProject(node->js.ps.ps_ProjInfo);
+						return result;
+					}
 					else
 						InstrCountFiltered2(node,1);
 				}
 				else
 					InstrCountFiltered1(node,1);
-				break;
-
+				continue;
+ 
 			case HJ_FILL_INNER_TUPLES:
-				node->hj_JoinState = HJ_NEED_NEW_OUTER;
+				node->hj_JoinState = HJ_FILL_INNER_TUPLES;
+				if(ExecScanHashTableForUnmatched(node,econtext)==false)
+					return NULL;
+				
 				/* modified:右外连接或者全连接时填充NULL */
-				if(!node->hj_Matched && HJ_FILL_INNER(node))
+				if(!node->hj_Matched&&HJ_FILL_INNER(node))
 				{
 					econtext->ecxt_outertuple = node->hj_NullOuterTupleSlot;
 					if(otherqual == NULL || ExecQual(otherqual,econtext))
@@ -782,7 +850,7 @@ ExecHashJoinImpl(PlanState *pstate, bool parallel)
 					else
 						InstrCountFiltered2(node,1);
 				}
-				continue;
+				break;
 			
 			default:
 				elog(ERROR, "unrecognized hashjoin state: %d",
@@ -790,11 +858,10 @@ ExecHashJoinImpl(PlanState *pstate, bool parallel)
 				return NULL;
 		}
 	}
-	
 }
  #endif
-
-
+ 
+ 
 /* ----------------------------------------------------------------
  *		ExecHashJoin
  *
@@ -810,9 +877,9 @@ ExecHashJoin(PlanState *pstate)
 	 */
 	return ExecHashJoinImpl(pstate, false);
 }
-
-
-
+ 
+ 
+ 
 /* ----------------------------------------------------------------
  *		ExecParallelHashJoin
  *
@@ -840,7 +907,7 @@ ExecParallelHashJoin(PlanState *pstate)
 	return ExecHashJoinImpl(pstate, false);
 }
 #endif
-
+ 
 /* ----------------------------------------------------------------
  *		ExecInitHashJoin
  *
@@ -855,7 +922,7 @@ ExecInitHashJoin(HashJoin *node, EState *estate, int eflags)
 	
 	Plan	   *outerNode;	
 	Hash	   *hashNode;
-
+ 
 	TupleDesc	outerDesc,
 				innerDesc;
 	const TupleTableSlotOps *ops;
@@ -994,7 +1061,7 @@ ExecInitHashJoin(HashJoin *node, EState *estate, int eflags)
  
 	return hjstate;
 }
-
+ 
 #else
 HashJoinState *
 ExecInitHashJoin(HashJoin *node, EState *estate, int eflags)
@@ -1002,7 +1069,7 @@ ExecInitHashJoin(HashJoin *node, EState *estate, int eflags)
 	Assert(!(eflags & (EXEC_FLAG_BACKWARD | EXEC_FLAG_MARK)));
     
     HashJoinState *hashjoin_state;
-
+ 
 	hashjoin_state = makeNode(HashJoinState);
 	
 	/* modified:初始化哈希连接的计划和方式*/
@@ -1010,7 +1077,7 @@ ExecInitHashJoin(HashJoin *node, EState *estate, int eflags)
     hashjoin_state->js.ps.ExecProcNode = ExecHashJoin;
 	hashjoin_state->js.ps.plan = (Plan *) node;
 	hashjoin_state->js.ps.state = estate;
-
+ 
     /*modified:为哈希连接创建一个新的表达式上下文内存空间*/
 	ExecAssignExprContext(estate, &hashjoin_state->js.ps);
 	
@@ -1038,15 +1105,14 @@ ExecInitHashJoin(HashJoin *node, EState *estate, int eflags)
 	hashjoin_state->hj_InnerTupleSlot = ExecInitExtraTupleSlot(estate, inner_Desc, inner_ops);
     ExecInitResultTupleSlotTL(&hashjoin_state->js.ps, &TTSOpsVirtual);
 	ExecAssignProjectionInfo(&hashjoin_state->js.ps, NULL);	
-
+ 
 	hashjoin_state->hashclauses = node->hashclauses;
 	hashjoin_state->hj_OuterHashKeys = ExecInitExprList(node->hashkeys,(PlanState*)hashjoin_state);
 	hashjoin_state->hj_InnerHashKeys = ExecInitExprList(node->hashkeys,(PlanState*)hashjoin_state);
 	hashjoin_state->hj_HashOperators = node->hashoperators;
 	hashjoin_state->hj_Collations = node->hashcollations;
     
-    node->join.jointype = JOIN_INNER;
-
+ 
 	/* modified；根据join方式设置元组槽 */
 	/* explain: ExecInitNullTupleSlot:用于初始化一个全为NULL的元组操，用于全/外连接*/
 	switch (node->join.jointype)
@@ -1076,19 +1142,19 @@ ExecInitHashJoin(HashJoin *node, EState *estate, int eflags)
 			elog(ERROR, "unrecognized join type: %d",
 				 (int) node->join.jointype);
 	}
-
+ 
 	
 /*
 * detect whether we need only consider the first matching inner tuple
 */
 	hashjoin_state->js.single_match = (node->join.inner_unique ||
 								node->join.jointype == JOIN_SEMI);
-
+ 
     /*modified:初始化子表达式*/ 
 	hashjoin_state->js.ps.qual = ExecInitQual(node->join.plan.qual, (PlanState *) hashjoin_state);
 	hashjoin_state->js.joinqual = ExecInitQual(node->join.joinqual, (PlanState *) hashjoin_state);
 	hashjoin_state->hashclauses = ExecInitQual(node->hashclauses, (PlanState *) hashjoin_state);
-
+ 
     /* modified:初始化哈希连接节点，准备哈希连接操作 */
 	HashState* hashstate;
 	TupleTableSlot *slot;
@@ -1102,7 +1168,7 @@ ExecInitHashJoin(HashJoin *node, EState *estate, int eflags)
 	hashjoin_state->hj_CurOuterTuple = NULL;
 	hashjoin_state->hj_FirstOuterTupleSlot = NULL;
 	hashjoin_state->hj_FirstInnerTupleSlot = NULL;
-
+ 
     /* modified:初始化哈希连接状态中的哈希表，哈希值和哈希桶元数据 */
 	hashjoin_state->hj_InnerHashTable = NULL;
 	hashjoin_state->hj_OuterHashTable = NULL;
@@ -1110,9 +1176,9 @@ ExecInitHashJoin(HashJoin *node, EState *estate, int eflags)
 	hashjoin_state->hj_OuterCurHashValue = 0;
 	hashjoin_state->hj_InnerCurBucketNo = 0;
 	hashjoin_state->hj_OuterCurBucketNo = 0;
-	hashjoin_state->hj_InnerCurSkewBucketNo = INVALID_SKEW_BUCKET_NO;
-	hashjoin_state->hj_OuterCurSkewBucketNo = INVALID_SKEW_BUCKET_NO;	
-
+	//hashjoin_state->hj_InnerCurSkewBucketNo = INVALID_SKEW_BUCKET_NO;
+	//hashjoin_state->hj_OuterCurSkewBucketNo = INVALID_SKEW_BUCKET_NO;	
+ 
     /* modified:将哈希条件分解为左右两个子表达式 */
 	List *left_clauses,*right_clauses;
 	List* operators;
@@ -1132,7 +1198,7 @@ ExecInitHashJoin(HashJoin *node, EState *estate, int eflags)
 	hashjoin_state->hj_OuterHashKeys = left_clauses;
 	hashjoin_state->hj_InnerHashKeys = right_clauses;
 	hashjoin_state->hj_HashOperators = operators;
-
+ 
     /* modified:初始化哈希连接状态参数 */
 	hashjoin_state->js.ps.ps_InnerTupleSlot = NULL;
 	hashjoin_state->js.ps.ps_OuterTupleSlot = NULL;
@@ -1146,8 +1212,8 @@ ExecInitHashJoin(HashJoin *node, EState *estate, int eflags)
 	return hashjoin_state;
 }	
 #endif
-
-
+ 
+ 
  
 /* ----------------------------------------------------------------
  *		ExecEndHashJoin
@@ -1199,7 +1265,7 @@ ExecEndHashJoin(HashJoinState *node)
 	ExecClearTuple(node->hj_InnerHashTupleSlot);
 	ExecClearTuple(node->hj_OuterHashTupleSlot);
  #endif
-
+ 
 	/*
 	 * clean up subtrees
 	 */
@@ -1357,7 +1423,7 @@ ExecParallelHashJoinOuterGetTuple(PlanState *outerNode,
 	return NULL;
 }
 #endif
-
+ 
 /*
  * ExecHashJoinNewBatch
  *		switch to a new hashjoin batch
@@ -1472,13 +1538,13 @@ ExecHashJoinNewBatch(HashJoinState *hjstate)
 					 errmsg("could not rewind hash-join temporary file")));
  
 		TupleTableSlot *hashTupleSlot;
-
+ 
 	#if defined MIXJOIN_MODE	
 		hashTupleSlot = hjstate->hj_HashTupleSlot;
 	#else
 		hashTupleSlot = hjstate->hj_InnerHashTupleSlot;
 	#endif
-
+ 
 		while ((slot = ExecHashJoinGetSavedTuple(hjstate,
 												 innerFile,
 												 &hashvalue,
@@ -1488,7 +1554,7 @@ ExecHashJoinNewBatch(HashJoinState *hjstate)
 			 * NOTE: some tuples may be sent to future batches.  Also, it is
 			 * possible for hashtable->nbatch to be increased here!
 			 */
-			ExecHashTableInsert(hashtable, slot, hashvalue);
+			ExecHashTableInsert(hashtable, slot, hashvalue,NULL);
 		}
  
 		/*
@@ -1513,8 +1579,8 @@ ExecHashJoinNewBatch(HashJoinState *hjstate)
 	return true;
 }
  
-
-
+ 
+ 
 #if defined MIXJOIN_MODE
 /*
  * Choose a batch to work on, and attach to it.  Returns true if successful,
@@ -1640,8 +1706,8 @@ ExecParallelHashJoinNewBatch(HashJoinState *hjstate)
 	return false;
 }
 #endif
-
-
+ 
+ 
 /*
  * ExecHashJoinSaveTuple
  *		save a tuple to a batch file.
@@ -1817,9 +1883,9 @@ ExecShutdownHashJoin(HashJoinState *node)
 		ExecHashTableDetach(node->hj_HashTable);
 	}
 }
-
+ 
 #else
-
+ 
 void
 ExecReScanHashJoin(HashJoinState *node)
 {
@@ -1850,8 +1916,8 @@ ExecReScanHashJoin(HashJoinState *node)
 	node->hj_InnerCurHashValue = 0;
 	node->hj_InnerCurBucketNo = 0;
 	node->hj_OuterCurBucketNo = 0;
-	node->hj_InnerCurSkewBucketNo = INVALID_SKEW_BUCKET_NO;
-	node->hj_OuterCurSkewBucketNo = INVALID_SKEW_BUCKET_NO;
+	//node->hj_InnerCurSkewBucketNo = INVALID_SKEW_BUCKET_NO;
+	//node->hj_OuterCurSkewBucketNo = INVALID_SKEW_BUCKET_NO;
 	node->hj_CurInnerTuple = NULL;
 	node->hj_CurOuterTuple = NULL;
  
@@ -1859,13 +1925,13 @@ ExecReScanHashJoin(HashJoinState *node)
 	node->js.ps.ps_InnerTupleSlot = NULL;
 	node->hj_FirstOuterTupleSlot = NULL;
 	node->hj_FirstInnerTupleSlot = NULL;
-
+ 
 	node->hj_Matched = false;
 	
 	if (node->js.ps.lefttree->chgParam == NULL)
 		ExecReScan(node->js.ps.lefttree);
 }
-
+ 
 void
 ExecShutdownHashJoin(HashJoinState *node)
 {
@@ -1880,9 +1946,9 @@ ExecShutdownHashJoin(HashJoinState *node)
 		node->hj_OuterHashTable = NULL;
 	}
 }   
-
+ 
 #endif
-
+ 
 #ifdef MIXJOIN_MODE
 static void
 ExecParallelHashJoinPartitionOuter(HashJoinState *hjstate)
@@ -1930,16 +1996,16 @@ ExecParallelHashJoinPartitionOuter(HashJoinState *hjstate)
 		sts_end_write(hashtable->batches[i].outer_tuples);
 }
 #endif 
-
-
+ 
+ 
 void
 ExecHashJoinEstimate(HashJoinState *state, ParallelContext *pcxt)
 {
 	shm_toc_estimate_chunk(&pcxt->estimator, sizeof(ParallelHashJoinState));
 	shm_toc_estimate_keys(&pcxt->estimator, 1);
 }
-
-
+ 
+ 
 #if defined MIXJOIN_MODE 
 void
 ExecHashJoinInitializeDSM(HashJoinState *state, ParallelContext *pcxt)
@@ -2031,22 +2097,22 @@ ExecHashJoinReInitializeDSM(HashJoinState *state, ParallelContext *cxt)
 	/* Reset build_barrier to PHJ_BUILD_ELECTING so we can go around again. */
 	BarrierInit(&pstate->build_barrier, 0);
 }
-
+ 
 #else
 void
 ExecHashJoinInitializeDSM(HashJoinState *state, ParallelContext *pcxt)
 {
 	return;
 }
-
+ 
 void ExecHashJoinReInitializeDSM(HashJoinState *state, ParallelContext *cxt)
 {
 	return;
 }
-
+ 
 #endif
-
-
+ 
+ 
 void
 ExecHashJoinInitializeWorker(HashJoinState *state,
 							 ParallelWorkerContext *pwcxt)
